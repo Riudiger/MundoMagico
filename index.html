@@ -1622,49 +1622,100 @@ function setActiveNav(el) {
 }
 
 // ===== BACKENDLESS API =====
-async function blGet(table, where='', limit=100) {
-  let url = `${BASE_URL}/data/${table}?pageSize=${limit}`;
-  if (where) url += `&where=${encodeURIComponent(where)}`;
-  const res = await fetch(url, { headers: { 'Content-Type':'application/json' } });
-  if (!res.ok) throw new Error('Backendless GET error');
-  return res.json();
+// Headers padrão — inclui user-token quando o usuário está logado
+function blHeaders(extra = {}) {
+  const h = { 'Content-Type': 'application/json', ...extra };
+  if (currentUser && currentUser['user-token']) {
+    h['user-token'] = currentUser['user-token'];
+  }
+  return h;
+}
+
+async function blRequest(method, path, body = null) {
+  const opts = { method, headers: blHeaders() };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${BASE_URL}${path}`, opts);
+  let data;
+  try { data = await res.json(); } catch { data = {}; }
+  if (!res.ok) {
+    const msg = data.message || data.code || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function blGet(table, where = '', limit = 200) {
+  let qs = `pageSize=${limit}&sortBy=created%20DESC`;
+  if (where) qs += `&where=${encodeURIComponent(where)}`;
+  return blRequest('GET', `/data/${table}?${qs}`);
 }
 
 async function blPost(table, data) {
-  const res = await fetch(`${BASE_URL}/data/${table}`, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify(data)
-  });
-  if (!res.ok) throw new Error('Backendless POST error');
-  return res.json();
+  return blRequest('POST', `/data/${table}`, data);
 }
 
 async function blPut(table, id, data) {
-  const res = await fetch(`${BASE_URL}/data/${table}/${id}`, {
-    method: 'PUT',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify(data)
-  });
-  if (!res.ok) throw new Error('Backendless PUT error');
-  return res.json();
+  return blRequest('PUT', `/data/${table}/${id}`, data);
 }
 
 async function blDelete(table, id) {
-  const res = await fetch(`${BASE_URL}/data/${table}/${id}`, { method: 'DELETE' });
-  if (!res.ok) throw new Error('Backendless DELETE error');
-  return res.json();
+  return blRequest('DELETE', `/data/${table}/${id}`);
 }
 
-async function blUploadFile(filePath, file) {
+// Upload de arquivo para Backendless Files
+async function blUploadFile(folder, file) {
+  // Garante nome de arquivo sem espaços/caracteres especiais
+  const safeName = Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
   const formData = new FormData();
-  formData.append('file', file);
-  const res = await fetch(`${BASE_URL}/files/${filePath}/${file.name}`, {
-    method: 'POST',
-    body: formData
+  formData.append('file', file, safeName);
+
+  // Upload via REST multipart (sem Content-Type header — deixa o browser definir o boundary)
+  const headers = {};
+  if (currentUser && currentUser['user-token']) {
+    headers['user-token'] = currentUser['user-token'];
+  }
+
+  const res = await fetch(`${BASE_URL}/files/${folder}/${safeName}?overwrite=true`, {
+    method: 'PUT',
+    headers,
+    body: file   // PUT direto com o binário (mais simples e funciona no Backendless)
   });
-  if (!res.ok) throw new Error('Upload error');
-  return res.json();
+
+  let data;
+  try { data = await res.json(); } catch { data = {}; }
+  if (!res.ok) throw new Error(data.message || 'Erro no upload');
+
+  // Retorna a URL pública do arquivo
+  return { fileURL: data.fileURL || `https://backendlessappcontent.com/${APP_ID}/${API_KEY}/files/${folder}/${safeName}` };
+}
+
+// Busca usuários usando a rota /data/Users (não /users) — funciona sem autenticação de usuário
+async function blGetUsers(limit = 500) {
+  const qs = `pageSize=${limit}&sortBy=created%20DESC`;
+  const res = await fetch(`${BASE_URL}/data/Users?${qs}`, {
+    headers: blHeaders()
+  });
+  let data;
+  try { data = await res.json(); } catch { data = []; }
+  if (!res.ok) {
+    // Tenta rota alternativa
+    const res2 = await fetch(`${BASE_URL}/users?pageSize=${limit}`, { headers: blHeaders() });
+    try { data = await res2.json(); } catch { data = { data: [] }; }
+    return data.data || data || [];
+  }
+  return Array.isArray(data) ? data : (data.data || []);
+}
+
+async function blPutUser(id, data) {
+  const res = await fetch(`${BASE_URL}/data/Users/${id}`, {
+    method: 'PUT',
+    headers: blHeaders(),
+    body: JSON.stringify(data)
+  });
+  let resp;
+  try { resp = await res.json(); } catch { resp = {}; }
+  if (!res.ok) throw new Error(resp.message || 'Erro ao atualizar usuário');
+  return resp;
 }
 
 // ===== AUTH =====
@@ -1789,14 +1840,17 @@ async function verifyAdmin() {
   const err = document.getElementById('adminError');
   err.style.display = 'none';
 
+  const btn = document.querySelector('#adminLoginModal .btn-form');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading-spinner"></span> Verificando...'; }
   try {
-    // Busca a senha do admin do Backendless (tabela AdminConfig)
     const result = await blGet('AdminConfig', `key = 'admin_password'`, 1);
-    const stored = result[0]?.value;
+    const stored = result && result[0] ? result[0].value : null;
 
     if (!stored) {
-      // Se não existe, cria com senha padrão no primeiro acesso
-      err.textContent = 'Configure a senha admin no Backendless: tabela AdminConfig, campo key=admin_password, campo value=sua_senha';
+      err.innerHTML = `<b>Configure a senha no Backendless:</b><br>
+        1. Acesse seu console do Backendless<br>
+        2. Vá em Data → crie a tabela <b>AdminConfig</b><br>
+        3. Adicione uma linha: key = <b>admin_password</b> / value = <b>sua_senha</b>`;
       err.style.display = 'block';
       return;
     }
@@ -1807,14 +1861,17 @@ async function verifyAdmin() {
       closeAdminLogin();
       showPage('admin');
       renderAdmin();
-      showNotification('✅ Admin logado com sucesso!', 'success');
+      showNotification('✅ Bem-vindo ao painel admin!', 'success');
     } else {
-      err.style.display = 'block';
       err.textContent = 'Senha incorreta. Tente novamente.';
+      err.style.display = 'block';
     }
   } catch (e) {
+    console.error('[Admin] Erro ao verificar senha:', e);
+    err.innerHTML = `Erro de conexão: ${e.message}<br><small>Verifique se a tabela AdminConfig existe no Backendless e se as permissões de leitura estão públicas.</small>`;
     err.style.display = 'block';
-    err.textContent = 'Erro ao verificar senha. Verifique a tabela AdminConfig no Backendless.';
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '🔓 Entrar no Admin'; }
   }
 }
 
@@ -1827,9 +1884,17 @@ function logoutAdmin() {
 // ===== LOAD BOOKS =====
 async function loadBooks() {
   try {
-    const result = await blGet('Books', '', 200);
-    allBooks = result.length > 0 ? result : DEMO_BOOKS;
-  } catch {
+    const result = await blGet('Books', '', 500);
+    if (Array.isArray(result) && result.length > 0) {
+      allBooks = result;
+      console.log(`[Books] ${result.length} livros carregados do Backendless`);
+    } else {
+      console.warn('[Books] Nenhum livro no Backendless — usando demo');
+      allBooks = DEMO_BOOKS;
+    }
+  } catch(e) {
+    console.error('[Books] Erro ao carregar:', e.message);
+    showNotification('Aviso: usando livros de demonstração (' + e.message + ')', 'info');
     allBooks = DEMO_BOOKS;
   }
   renderHomeBooks();
@@ -2000,10 +2065,22 @@ function renderAdmin() {
 }
 
 async function loadAdminBooks() {
+  const tbody = document.getElementById('adminBooksTable');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:24px;opacity:0.5"><span class="loading-spinner"></span> Carregando ebooks...</td></tr>';
   try {
-    const result = await blGet('Books', '', 200);
-    allBooks = result.length > 0 ? result : DEMO_BOOKS;
-  } catch { allBooks = DEMO_BOOKS; }
+    const result = await blGet('Books', '', 500);
+    if (Array.isArray(result) && result.length > 0) {
+      allBooks = result;
+      console.log(`[AdminBooks] ${result.length} ebooks carregados`);
+    } else {
+      console.warn('[AdminBooks] Nenhum livro ainda no Backendless');
+      allBooks = [];
+    }
+  } catch(e) {
+    console.error('[AdminBooks] Erro:', e.message);
+    showNotification('Erro ao carregar ebooks: ' + e.message, 'error');
+    allBooks = [];
+  }
   renderAdminBooksTable(allBooks);
 }
 
@@ -2011,10 +2088,12 @@ async function loadAdminClients() {
   const tbody = document.getElementById('adminClientsTable');
   if (tbody) tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:32px;opacity:0.5"><span class="loading-spinner"></span> Carregando clientes...</td></tr>';
   try {
-    const result = await blGet('Users', '', 500);
-    allClients = result || [];
+    const result = await blGetUsers(500);
+    allClients = Array.isArray(result) ? result : [];
+    console.log(`[Clients] ${allClients.length} clientes carregados`);
   } catch (e) {
     allClients = [];
+    console.error('[Clients] Erro:', e.message);
     showNotification('Erro ao carregar clientes: ' + e.message, 'error');
   }
   renderClientMiniStats();
@@ -2179,11 +2258,10 @@ function quickChangePlan(clientId, currentPlan) {
   const labels = { free:'🌱 Grátis', basic:'⚡ Básico', premium:'👑 Premium', family:'🏰 Família' };
   const chosen = plans[(plans.indexOf(currentPlan) + 1) % plans.length];
   if (confirm(`Mudar plano para: ${labels[chosen]}?`)) {
-    blPut('Users', clientId, { plan: chosen })
+    blPutUser(clientId, { plan: chosen })
       .then(() => {
         showNotification(`✅ Plano alterado para ${labels[chosen]}!`, 'success');
         loadAdminClients();
-        // Atualiza dados do usuário logado se for o mesmo
         if (currentUser && currentUser.objectId === clientId) {
           currentUser.plan = chosen;
           localStorage.setItem('bl_user', JSON.stringify(currentUser));
@@ -2229,56 +2307,79 @@ function renderAdminStats() {
 async function saveBook() {
   const title = document.getElementById('bookTitle').value.trim();
   const genre = document.getElementById('bookGenre').value;
-  const age = document.getElementById('bookAge').value;
-  const emoji = document.getElementById('bookEmoji').value || '📚';
+  const age   = document.getElementById('bookAge').value;
+  const emoji = document.getElementById('bookEmoji').value || 'livro';
   const color = document.getElementById('bookColor').value;
-  const desc = document.getElementById('bookDesc').value.trim();
+  const desc  = document.getElementById('bookDesc').value.trim();
   const isFree = document.getElementById('bookFreeToggle').classList.contains('on');
 
-  if (!title || !genre || !age) return showNotification('Preencha título, gênero e faixa etária!', 'error');
+  if (!title || !genre || !age) return showNotification('Preencha titulo, genero e faixa etaria!', 'error');
 
-  showNotification('💾 Salvando ebook...', 'info');
+  const saveBtn = document.querySelector('[onclick="saveBook()"]');
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.innerHTML = '<span class="loading-spinner"></span> Salvando...'; }
+  showNotification('Salvando ebook...', 'info');
 
   let pdfUrl = '';
   let coverUrl = '';
 
-  // Upload PDF se selecionado
+  // Upload PDF
   if (uploadedPdfFile) {
     try {
-      const result = await blUploadFile('ebooks/pdfs', uploadedPdfFile);
-      pdfUrl = result.fileURL || '';
+      showNotification('Enviando PDF...', 'info');
+      const r = await blUploadFile('ebooks/pdfs', uploadedPdfFile);
+      pdfUrl = r.fileURL || '';
+      console.log('[Upload PDF] URL:', pdfUrl);
     } catch (e) {
-      showNotification('Erro ao enviar PDF: ' + e.message, 'error');
+      console.error('[Upload PDF] Erro:', e);
+      showNotification('Aviso: PDF nao enviado - ' + e.message, 'error');
     }
   }
 
-  // Upload Cover se selecionada
+  // Upload Capa
   if (uploadedCoverFile) {
     try {
-      const result = await blUploadFile('ebooks/covers', uploadedCoverFile);
-      coverUrl = result.fileURL || '';
+      showNotification('Enviando capa...', 'info');
+      const r = await blUploadFile('ebooks/covers', uploadedCoverFile);
+      coverUrl = r.fileURL || '';
+      console.log('[Upload Capa] URL:', coverUrl);
     } catch (e) {
-      showNotification('Erro ao enviar capa: ' + e.message, 'error');
+      console.error('[Upload Capa] Erro:', e);
+      showNotification('Aviso: Capa nao enviada - ' + e.message, 'error');
     }
   }
 
   try {
-    const bookData = { title, genre, age, emoji, color, desc, free: isFree, pdfUrl, coverUrl, created: new Date().toISOString() };
+    const bookData = {
+      title, genre,
+      age,
+      ageRange: age,
+      emoji, color, desc,
+      free: isFree,
+      pdfUrl, coverUrl,
+      created: new Date().toISOString()
+    };
+    console.log('[saveBook] Enviando dados:', bookData);
+
+    let result;
     if (editingBookId) {
-      await blPut('Books', editingBookId, bookData);
-      showNotification('✅ Ebook atualizado!', 'success');
+      result = await blPut('Books', editingBookId, bookData);
+      showNotification('Ebook atualizado com sucesso!', 'success');
     } else {
-      await blPost('Books', bookData);
-      showNotification('✅ Ebook criado!', 'success');
+      result = await blPost('Books', bookData);
+      console.log('[saveBook] Criado com ID:', result.objectId);
+      showNotification('Ebook criado e publicado no site!', 'success');
     }
     clearBookForm();
-    loadAdminBooks();
-    switchAdminTab('books', document.querySelector('[onclick*="\'books\'"]'));
+    await loadAdminBooks();
+    await loadBooks();  // atualiza grid publico
+    switchAdminTab('books', document.querySelectorAll('.admin-tab')[0]);
   } catch (e) {
-    showNotification('Erro: ' + e.message, 'error');
+    console.error('[saveBook] Erro final:', e);
+    showNotification('Erro ao salvar ebook: ' + e.message, 'error');
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.innerHTML = 'Salvar Ebook'; }
   }
 }
-
 function clearBookForm() {
   ['bookTitle','bookEmoji','bookDesc'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('bookGenre').value = '';
@@ -2350,9 +2451,13 @@ async function saveBookEdit() {
 async function toggleClientStatus(id, currentStatus) {
   const newStatus = currentStatus === 'inactive' ? 'active' : 'inactive';
   try {
-    await blPut('Users', id, { planStatus: newStatus });
+    await blPutUser(id, { planStatus: newStatus });
     showNotification(`✅ Cliente ${newStatus === 'active' ? 'ativado' : 'desativado'}!`, 'success');
     loadAdminClients();
+    if (currentUser && currentUser.objectId === id) {
+      currentUser.planStatus = newStatus;
+      localStorage.setItem('bl_user', JSON.stringify(currentUser));
+    }
   } catch (e) {
     showNotification('Erro: ' + e.message, 'error');
   }
@@ -2382,17 +2487,17 @@ async function saveClientEdit() {
     planStatus: document.getElementById('editClientStatus').value
   };
   try {
-    await blPut('Users', id, data);
+    await blPutUser(id, data);
     document.getElementById('editClientModal').classList.remove('open');
     showNotification('✅ Cliente atualizado!', 'success');
     loadAdminClients();
-    // Se o cliente editado for o usuário logado, atualizar os dados
+    // Atualiza sessão se for o próprio usuário logado
     if (currentUser && currentUser.objectId === id) {
       Object.assign(currentUser, data);
       localStorage.setItem('bl_user', JSON.stringify(currentUser));
     }
   } catch (e) {
-    showNotification('Erro: ' + e.message, 'error');
+    showNotification('Erro ao salvar: ' + e.message, 'error');
   }
 }
 
